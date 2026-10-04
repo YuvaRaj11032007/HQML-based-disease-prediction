@@ -1,0 +1,52 @@
+# Hybrid Quantum-Classical ML for Early Breast Cancer Detection
+
+# Data files (downloaded at runtime)
+data/
+*.tsv
+*.tsv.gz
+*.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Logs
+*.log
+wandb/
+
+# Model artifacts (keep results/ but not large model files)
+*.pt
+*.pth
+*.pkl
+!results/*.csv
+!results/*.png
+!results/*.json

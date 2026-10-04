@@ -1,0 +1,75 @@
+# ============================================================
+# Hybrid Quantum-Classical ML for Early Breast Cancer Detection
+# Configuration File
+# ============================================================
+
+data:
+  # UCSC Xena GDC TCGA-BRCA data URLs
+  expression_url: "https://gdc.xenahubs.net/download/TCGA-BRCA/Xena_Matrices/TCGA-BRCA.htseq_fpkm-uq.tsv.gz"
+  phenotype_url: "https://gdc.xenahubs.net/download/TCGA-BRCA/Xena_Matrices/TCGA-BRCA.GDC_phenotype.tsv.gz"
+  probemap_url: "https://gdc.xenahubs.net/download/gencode.v22.annotation.gene.probeMap"
+  data_dir: "data/"
+  test_size: 0.2          # held-out test fraction (patient-level)
+  random_seed: 42
+  valid_sample_types: ["01", "11"]   # 01=tumor, 11=normal
+
+features:
+  variance_threshold: 0.1           # remove near-zero variance genes
+  min_expression: 1.0               # minimum mean expression across samples
+  n_de_genes: 200                   # top DE genes from t-test
+  n_final_genes: 8                  # genes for quantum model (= qubits)
+  gene_counts_to_test: [4, 8, 10, 12]  # ablation on gene count
+
+quantum_model:
+  n_qubits: 8
+  n_layers: 2                       # StronglyEntanglingLayers depth
+  learning_rate: 0.02
+  batch_size: 32
+  max_epochs: 50
+  early_stopping_patience: 7
+  diff_method: "backprop"
+  device: "default.qubit"
+
+classical_baselines:
+  svm:
+    kernel: "rbf"
+    C_range: [0.1, 1, 10, 100]
+    gamma_range: ["scale", "auto"]
+  random_forest:
+    n_estimators: 200
+    max_depth_range: [5, 10, 20, null]
+  xgboost:
+    n_estimators: 200
+    max_depth: 6
+    learning_rate: 0.1
+
+evaluation:
+  n_folds: 5
+  n_seeds: 5
+  seeds: [42, 123, 456, 789, 1024]
+  metrics: ["accuracy", "sensitivity", "specificity", "auc"]
+  significance_alpha: 0.05
+
+ablation:
+  # Classical replacement for quantum circuit
+  replace_quantum: true            # whether to run ablation
+
+robustness:
+  learning_curve_fractions: [0.1, 0.25, 0.5, 1.0]
+  noise_levels: [0.01, 0.05]
+  noise_device: "default.mixed"
+
+explainability:
+  n_permutations: 30
+  shap_nsamples: 100
+  enrichr_gene_sets: ["KEGG_2021_Human", "GO_Biological_Process_2021", "MSigDB_Hallmark_2020"]
+
+training:
+  fast_mode: false
+  fast_max_epochs: 10
+  fast_n_seeds: 1
+  fast_n_folds: 3
+
+streamlit:
+  model_path: "results/trained_model.pt"
+  genes_path: "results/selected_genes.json"
