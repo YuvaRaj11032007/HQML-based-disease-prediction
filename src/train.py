@@ -30,15 +30,23 @@ import torch
 import yaml
 from sklearn.metrics import roc_auc_score, roc_curve
 
-from src.data import load_data, load_probemap
+from src.data import (
+    compute_imbalance_ratio,
+    load_data,
+    load_geo_data,
+    load_probemap,
+    rank_normalize_cohort,
+)
 from src.evaluate import (
     aggregate_cv_results,
     compute_metrics,
     find_optimal_threshold,
     format_results_table,
+    nadeau_bengio_ttest,
     paired_wilcoxon_test,
 )
 from src.explain import (
+    compute_selection_stability,
     pathway_enrichment,
     permutation_importance_manual,
     plot_learning_curve,
@@ -54,6 +62,7 @@ from src.features import (
     remove_low_quality_genes,
     scale_features,
     select_features_fold,
+    select_features_hierarchical,
 )
 from src.models_classical import (
     get_classical_predictions,
@@ -141,7 +150,8 @@ def run_cv_experiment(
 
     all_fold_results = {
         "hybrid": [],
-        "ablation": [],
+        "ablation_5": [],
+        "ablation_6": [],
         "svm_8": [],
         "rf_8": [],
         "xgb_8": [],
@@ -150,6 +160,7 @@ def run_cv_experiment(
         "xgb_50": [],
     }
     all_selected_genes = []
+    fold_top_200_de = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         logger.info(f"\n{'='*60}")
@@ -161,24 +172,17 @@ def run_cv_experiment(
         X_fold_val = X_trainval.iloc[val_idx]
         y_fold_val = y_trainval.iloc[val_idx]
 
-        # --- Feature selection on training fold only ---
-        selected_genes = select_features_fold(
+        # --- Hierarchical feature selection: single Welch's t-test step on training fold only ---
+        selected_genes, selected_50, top_200_de = select_features_hierarchical(
             X_fold_train,
             y_fold_train,
             n_de_genes=feat_cfg["n_de_genes"],
-            n_final_genes=n_final_genes,
+            n_qubit_genes=n_final_genes,
+            n_reference_genes=50,
             seed=seed,
         )
         all_selected_genes.append(selected_genes)
-
-        # Also select top 50 for classical baselines reference
-        selected_50 = select_features_fold(
-            X_fold_train,
-            y_fold_train,
-            n_de_genes=feat_cfg["n_de_genes"],
-            n_final_genes=50,
-            seed=seed,
-        )
+        fold_top_200_de.extend(top_200_de)
 
         # Subset features
         X_tr_8 = X_fold_train[selected_genes].values
@@ -195,8 +199,8 @@ def run_cv_experiment(
 
         pos_weight = compute_class_weights(y_tr)
 
-        # --- 1. Hybrid Quantum Model ---
-        logger.info("Training Hybrid Quantum Model...")
+        # --- 1. Hybrid Quantum Model (57 trainable parameters) ---
+        logger.info("Training Hybrid Quantum Model (57 parameters)...")
         hybrid_model = HybridQuantumModel(
             n_qubits=n_final_genes,
             n_layers=qm_cfg["n_layers"],
@@ -220,15 +224,14 @@ def run_cv_experiment(
         h_metrics["threshold"] = h_threshold
         all_fold_results["hybrid"].append(h_metrics)
 
-        # --- 2. Ablation: Classical replacement ---
-        logger.info("Training Ablation (Classical Replacement)...")
-        q_params = hybrid_model.count_parameters()
-        abl_model = ClassicalAblationModel(
+        # --- 2. Classical Ablations: 51 params (H=5) and 61 params (H=6) sandwiching 57 params ---
+        logger.info("Training Classical Ablation-5 (51 parameters, 5 hidden units)...")
+        abl5_model = ClassicalAblationModel(
             n_inputs=n_final_genes,
-            n_quantum_params=q_params["quantum"],
+            hidden_units=5,
         )
-        abl_model, a_hist = train_torch_model(
-            abl_model,
+        abl5_model, a5_hist = train_torch_model(
+            abl5_model,
             X_tr_8s, y_tr, X_va_8s, y_va,
             lr=qm_cfg["learning_rate"],
             batch_size=qm_cfg["batch_size"],
@@ -237,11 +240,32 @@ def run_cv_experiment(
             pos_weight=pos_weight,
             seed=seed,
         )
-        a_probs = get_torch_predictions(abl_model, X_va_8s)
-        a_threshold = find_optimal_threshold(y_va, a_probs)
-        a_metrics = compute_metrics(y_va, a_probs, a_threshold)
-        a_metrics["train_time"] = a_hist["train_time"]
-        all_fold_results["ablation"].append(a_metrics)
+        a5_probs = get_torch_predictions(abl5_model, X_va_8s)
+        a5_threshold = find_optimal_threshold(y_va, a5_probs)
+        a5_metrics = compute_metrics(y_va, a5_probs, a5_threshold)
+        a5_metrics["train_time"] = a5_hist["train_time"]
+        all_fold_results["ablation_5"].append(a5_metrics)
+
+        logger.info("Training Classical Ablation-6 (61 parameters, 6 hidden units)...")
+        abl6_model = ClassicalAblationModel(
+            n_inputs=n_final_genes,
+            hidden_units=6,
+        )
+        abl6_model, a6_hist = train_torch_model(
+            abl6_model,
+            X_tr_8s, y_tr, X_va_8s, y_va,
+            lr=qm_cfg["learning_rate"],
+            batch_size=qm_cfg["batch_size"],
+            max_epochs=max_epochs,
+            patience=qm_cfg["early_stopping_patience"],
+            pos_weight=pos_weight,
+            seed=seed,
+        )
+        a6_probs = get_torch_predictions(abl6_model, X_va_8s)
+        a6_threshold = find_optimal_threshold(y_va, a6_probs)
+        a6_metrics = compute_metrics(y_va, a6_probs, a6_threshold)
+        a6_metrics["train_time"] = a6_hist["train_time"]
+        all_fold_results["ablation_6"].append(a6_metrics)
 
         # --- 3. Classical baselines on 8 genes ---
         logger.info("Training classical baselines (8 genes)...")
@@ -286,7 +310,8 @@ def run_cv_experiment(
         logger.info(
             f"Fold {fold_idx+1} results: "
             f"Hybrid AUC={h_metrics['auc']:.4f}, "
-            f"Ablation AUC={a_metrics['auc']:.4f}, "
+            f"Ablation-5 AUC={a5_metrics['auc']:.4f}, "
+            f"Ablation-6 AUC={a6_metrics['auc']:.4f}, "
             f"SVM AUC={svm_metrics['auc']:.4f}, "
             f"RF AUC={rf_metrics['auc']:.4f}, "
             f"XGB AUC={xgb_metrics['auc']:.4f}"
@@ -295,9 +320,11 @@ def run_cv_experiment(
     return {
         "fold_results": all_fold_results,
         "selected_genes": all_selected_genes,
+        "top_200_de": fold_top_200_de,
         "param_counts": {
             "hybrid": hybrid_model.count_parameters(),
-            "ablation": abl_model.count_parameters(),
+            "ablation_5": abl5_model.count_parameters(),
+            "ablation_6": abl6_model.count_parameters(),
         },
     }
 
@@ -488,7 +515,8 @@ def main():
 
     expr_df, labels, patient_ids = load_data(config, synthetic=args.synthetic)
     logger.info(f"Data shape: {expr_df.shape}")
-    logger.info(f"Label distribution: {labels.value_counts().to_dict()}")
+    imbalance_ratio, imbalance_str = compute_imbalance_ratio(labels)
+    logger.info(f"Empirical class distribution: {labels.value_counts().to_dict()} (Ratio: {imbalance_str})")
 
     # ================================================================
     # PHASE 2: Preprocessing
@@ -522,7 +550,7 @@ def main():
         seed=seed,
     )
 
-    logger.info(f"Train+val: {X_trainval.shape}, Test (held-out): {X_test.shape}")
+    logger.info(f"Train+val pool: {X_trainval.shape}, Held-out test set: {X_test.shape}")
 
     # ================================================================
     # PHASE 3: Cross-Validation Experiments
@@ -539,11 +567,19 @@ def main():
 
     n_final_genes = feat_cfg["n_final_genes"]
 
-    all_seed_results = {}
-    for model_key in [
-        "hybrid", "ablation", "svm_8", "rf_8", "xgb_8", "svm_50", "rf_50", "xgb_50"
-    ]:
-        all_seed_results[model_key] = []
+    all_seed_results = {
+        "hybrid": [],
+        "ablation_5": [],
+        "ablation_6": [],
+        "svm_8": [],
+        "rf_8": [],
+        "xgb_8": [],
+        "svm_50": [],
+        "rf_50": [],
+        "xgb_50": [],
+    }
+    all_selected_genes_across_all_runs = []
+    top_200_de_all = []
 
     last_cv_result = None
     for seed_idx, seed in enumerate(seeds):
@@ -556,6 +592,8 @@ def main():
             n_folds=n_folds, seed=seed, fast=fast, n_final_genes=n_final_genes,
         )
         last_cv_result = cv_result
+        all_selected_genes_across_all_runs.extend(cv_result["selected_genes"])
+        top_200_de_all.extend(cv_result.get("top_200_de", []))
 
         for model_key in all_seed_results:
             all_seed_results[model_key].extend(cv_result["fold_results"][model_key])
@@ -568,14 +606,15 @@ def main():
     logger.info("=" * 50)
 
     model_names = {
-        "hybrid": "Hybrid Quantum (8 genes)",
-        "ablation": "Classical Ablation (8 genes)",
+        "hybrid": "Hybrid Quantum (8 genes, 57 params)",
+        "ablation_5": "Classical Ablation-5 (8 genes, 51 params)",
+        "ablation_6": "Classical Ablation-6 (8 genes, 61 params)",
         "svm_8": "SVM-RBF (8 genes)",
         "rf_8": "Random Forest (8 genes)",
         "xgb_8": "XGBoost (8 genes)",
-        "svm_50": "SVM-RBF (50 genes)",
-        "rf_50": "Random Forest (50 genes)",
-        "xgb_50": "XGBoost (50 genes)",
+        "svm_50": "SVM-RBF (50 genes, reference)",
+        "rf_50": "Random Forest (50 genes, reference)",
+        "xgb_50": "XGBoost (50 genes, reference)",
     }
 
     aggregated = {}
@@ -595,13 +634,30 @@ def main():
     # Parameter counts
     if last_cv_result and "param_counts" in last_cv_result:
         pc = last_cv_result["param_counts"]
-        print("\nParameter Counts:")
-        print(f"  Hybrid Quantum Model: {pc['hybrid']}")
-        print(f"  Classical Ablation:   {pc['ablation']}")
+        print("\nParameter Counts (Sandwiching Ablation Design):")
+        print(f"  Hybrid Quantum Model:   {pc['hybrid']}")
+        print(f"  Classical Ablation-5:   {pc['ablation_5']}")
+        print(f"  Classical Ablation-6:   {pc['ablation_6']}")
 
         param_df = pd.DataFrame([
-            {"Model": "Hybrid Quantum", **pc["hybrid"]},
-            {"Model": "Classical Ablation", **pc["ablation"]},
+            {
+                "Model": "Classical Ablation-5",
+                "Total Parameters": pc["ablation_5"]["total"],
+                "Architecture": "Linear(8,5) + Tanh + Linear(5,1)",
+                "Comparison to Hybrid": "Lower bound (-6 params)",
+            },
+            {
+                "Model": "Hybrid Quantum",
+                "Total Parameters": pc["hybrid"]["total"],
+                "Architecture": "AngleEmbedding(8) + StronglyEntangling(L=2) + Linear(8,1)",
+                "Comparison to Hybrid": "Target (48 quantum + 9 classical)",
+            },
+            {
+                "Model": "Classical Ablation-6",
+                "Total Parameters": pc["ablation_6"]["total"],
+                "Architecture": "Linear(8,6) + Tanh + Linear(6,1)",
+                "Comparison to Hybrid": "Upper bound (+4 params)",
+            },
         ])
         param_df.to_csv("results/parameter_counts.csv", index=False)
 
@@ -613,8 +669,11 @@ def main():
     logger.info("=" * 50)
 
     hybrid_aucs = [m["auc"] for m in all_seed_results["hybrid"]]
+    test_baselines = ["ablation_5", "ablation_6", "svm_8", "rf_8", "xgb_8"]
+
+    # 1. Wilcoxon Tests
     stat_results = {}
-    for key in ["ablation", "svm_8", "rf_8", "xgb_8"]:
+    for key in test_baselines:
         baseline_aucs = [m["auc"] for m in all_seed_results[key]]
         stat_results[model_names[key]] = paired_wilcoxon_test(
             hybrid_aucs, baseline_aucs, metric_name=f"AUC: Hybrid vs {model_names[key]}"
@@ -622,20 +681,51 @@ def main():
 
     stat_df = pd.DataFrame(stat_results).T
     stat_df.to_csv("results/statistical_tests.csv")
-    print("\nWilcoxon Tests (Hybrid vs Baselines):")
+    print("\nWilcoxon Tests (Hybrid vs Baselines on CV Folds):")
     print(stat_df.to_string())
 
+    # 2. Nadeau-Bengio Corrected Resampled t-Test
+    n_cv_test = max(1, len(X_trainval) // n_folds)
+    n_cv_train = max(1, len(X_trainval) - n_cv_test)
+    nb_results = {}
+    for key in test_baselines:
+        baseline_aucs = [m["auc"] for m in all_seed_results[key]]
+        nb_results[model_names[key]] = nadeau_bengio_ttest(
+            hybrid_aucs,
+            baseline_aucs,
+            n_train=n_cv_train,
+            n_test=n_cv_test,
+            metric_name=f"AUC: Hybrid vs {model_names[key]}",
+        )
+
+    nb_df = pd.DataFrame(nb_results).T
+    nb_df.to_csv("results/nadeau_bengio_tests.csv")
+    print("\nNadeau-Bengio Corrected Resampled t-Tests (1/R + n_test/n_train correction):")
+    print(nb_df.to_string())
+
     # ================================================================
-    # PHASE 6: Selected Genes
+    # PHASE 6: Selected Genes & Selection Stability
     # ================================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("PHASE 6: Gene Selection & Stability Analysis")
+    logger.info("=" * 50)
+
     if last_cv_result and "selected_genes" in last_cv_result:
         selected = last_cv_result["selected_genes"][-1]
         with open("results/selected_genes.json", "w") as f:
             json.dump(selected, f, indent=2)
         logger.info(f"Selected genes (last fold): {selected}")
 
+    stability_df = compute_selection_stability(
+        all_selected_genes_across_all_runs,
+        top_k=n_final_genes,
+        output_png="results/selection_stability.png",
+    )
+    stability_df.to_csv("results/selection_stability.csv", index=False)
+    logger.info(f"Gene Selection Stability (Top Stably Selected Across Folds):\n{stability_df.head(10)}")
+
     # ================================================================
-    # PHASE 7: Robustness - Learning Curve
+    # PHASE 7: Robustness - Learning Curve & Noisy Simulation
     # ================================================================
     logger.info("\n" + "=" * 50)
     logger.info("PHASE 7: Robustness Experiments")
@@ -686,16 +776,16 @@ def main():
             pd.DataFrame(noise_results).to_csv("results/noisy_simulation.csv", index=False)
 
     # ================================================================
-    # PHASE 8: Explainability
+    # PHASE 8: Explainability & Pathway Enrichment
     # ================================================================
     logger.info("\n" + "=" * 50)
-    logger.info("PHASE 8: Explainability")
+    logger.info("PHASE 8: Explainability & Pathway Enrichment")
     logger.info("=" * 50)
 
     if last_cv_result and "selected_genes" in last_cv_result:
         sel_genes = last_cv_result["selected_genes"][-1]
 
-        # Train one final model for explainability
+        # Train one representative model for explainability
         folds = get_patient_cv_folds(X_trainval, y_trainval, pid_trainval, n_folds, seed=42)
         train_idx, val_idx = folds[0]
 
@@ -726,8 +816,8 @@ def main():
         rf_final, _ = train_random_forest(X_tr_s, y_tr, X_va_s, y_va, cl_cfg["random_forest"], seed=42)
         xgb_final, _ = train_xgboost(X_tr_s, y_tr, X_va_s, y_va, cl_cfg["xgboost"], seed=42)
 
-        # Permutation importance
-        logger.info("Computing permutation importance...")
+        # Permutation importance (evaluated via ROC-AUC drop)
+        logger.info("Computing permutation importance (ROC-AUC drop)...")
         models_for_perm = {
             "Hybrid": (hybrid_final, True),
             "SVM": (svm_final, False),
@@ -754,18 +844,27 @@ def main():
         if shap_vals is not None:
             plot_shap_summary(shap_vals, X_va_s, sel_genes, "results/shap_summary.png")
 
-        # Pathway enrichment
-        logger.info("Running pathway enrichment...")
-        # Filter out synthetic gene names for enrichment
-        real_genes = [g for g in sel_genes if not g.startswith("ENSG")]
-        if real_genes:
-            enrich_results = pathway_enrichment(
-                real_genes,
-                config["explainability"]["enrichr_gene_sets"],
-                output_dir="results",
-            )
-            if enrich_results is not None:
-                enrich_results.to_csv("results/pathway_enrichment.csv", index=False)
+        # Pathway enrichment on top-200 differentially expressed genes
+        logger.info("Running pathway enrichment on top-200 DE genes...")
+        _, _, top_200_de_pool = select_features_hierarchical(
+            X_trainval,
+            y_trainval,
+            n_de_genes=feat_cfg["n_de_genes"],
+            n_qubit_genes=n_final_genes,
+            n_reference_genes=50,
+            seed=42,
+        )
+        real_genes_de = [g for g in top_200_de_pool if not g.startswith("ENSG")]
+        if not real_genes_de:
+            real_genes_de = top_200_de_pool
+
+        enrich_results = pathway_enrichment(
+            real_genes_de,
+            config["explainability"]["enrichr_gene_sets"],
+            output_dir="results",
+        )
+        if enrich_results is not None:
+            enrich_results.to_csv("results/pathway_enrichment.csv", index=False)
 
         # Save model for Streamlit
         torch.save(hybrid_final.state_dict(), "results/trained_model.pt")
@@ -782,114 +881,197 @@ def main():
     logger.info("PHASE 9: Held-Out Test Set Evaluation")
     logger.info("=" * 50)
 
-    if last_cv_result and "selected_genes" in last_cv_result:
-        sel_genes = last_cv_result["selected_genes"][-1]
+    # Feature selection on the full train/val pool only (never seeing held-out test set)
+    final_genes_8, final_genes_50, _ = select_features_hierarchical(
+        X_trainval,
+        y_trainval,
+        n_de_genes=feat_cfg["n_de_genes"],
+        n_qubit_genes=n_final_genes,
+        n_reference_genes=50,
+        seed=42,
+    )
 
-        # Retrain on FULL train+val using last selected genes
-        X_train_full = X_trainval[sel_genes].values
-        y_train_full = y_trainval.values
-        X_test_sel = X_test[sel_genes].values
-        y_test_arr = y_test.values
+    X_train_full = X_trainval[final_genes_8].values
+    y_train_full = y_trainval.values
+    X_test_sel = X_test[final_genes_8].values
+    y_test_arr = y_test.values
 
-        # Split a small portion for validation (for early stopping / threshold)
-        from sklearn.model_selection import train_test_split
-        tr_idx, va_idx = train_test_split(
-            np.arange(len(y_train_full)),
-            test_size=0.15, stratify=y_train_full, random_state=42
+    # Split a small portion for validation (for threshold tuning / early stopping)
+    from sklearn.model_selection import train_test_split
+    tr_idx, va_idx = train_test_split(
+        np.arange(len(y_train_full)),
+        test_size=0.15, stratify=y_train_full, random_state=42
+    )
+
+    X_tr_raw = X_train_full[tr_idx]
+    y_tr_final = y_train_full[tr_idx]
+    X_va_raw = X_train_full[va_idx]
+    y_va_final = y_train_full[va_idx]
+
+    # Scale: fit on training portion of pool only!
+    X_tr_final, X_va_final, X_te_s, scaler_test = scale_features(
+        X_tr_raw, X_va_raw, X_test_sel
+    )
+
+    pos_weight = compute_class_weights(y_tr_final)
+    qm_cfg = config["quantum_model"]
+    max_epochs_t = config["training"]["fast_max_epochs"] if fast else qm_cfg["max_epochs"]
+
+    # 1. Final Hybrid Quantum model (57 params)
+    hybrid_test = HybridQuantumModel(n_qubits=len(final_genes_8), n_layers=qm_cfg["n_layers"])
+    hybrid_test, _ = train_torch_model(
+        hybrid_test, X_tr_final, y_tr_final, X_va_final, y_va_final,
+        lr=qm_cfg["learning_rate"], batch_size=qm_cfg["batch_size"],
+        max_epochs=max_epochs_t, pos_weight=pos_weight, seed=42,
+    )
+    h_val_probs = get_torch_predictions(hybrid_test, X_va_final)
+    h_test_threshold = find_optimal_threshold(y_va_final, h_val_probs)
+    h_test_probs = get_torch_predictions(hybrid_test, X_te_s)
+    h_test_metrics = compute_metrics(y_test_arr, h_test_probs, h_test_threshold)
+
+    # 2. Final Classical Ablation-5 (51 params)
+    abl5_test = ClassicalAblationModel(n_inputs=len(final_genes_8), hidden_units=5)
+    abl5_test, _ = train_torch_model(
+        abl5_test, X_tr_final, y_tr_final, X_va_final, y_va_final,
+        lr=qm_cfg["learning_rate"], batch_size=qm_cfg["batch_size"],
+        max_epochs=max_epochs_t, pos_weight=pos_weight, seed=42,
+    )
+    abl5_val_probs = get_torch_predictions(abl5_test, X_va_final)
+    abl5_threshold = find_optimal_threshold(y_va_final, abl5_val_probs)
+    abl5_tp = get_torch_predictions(abl5_test, X_te_s)
+    abl5_test_m = compute_metrics(y_test_arr, abl5_tp, abl5_threshold)
+
+    # 3. Final Classical Ablation-6 (61 params)
+    abl6_test = ClassicalAblationModel(n_inputs=len(final_genes_8), hidden_units=6)
+    abl6_test, _ = train_torch_model(
+        abl6_test, X_tr_final, y_tr_final, X_va_final, y_va_final,
+        lr=qm_cfg["learning_rate"], batch_size=qm_cfg["batch_size"],
+        max_epochs=max_epochs_t, pos_weight=pos_weight, seed=42,
+    )
+    abl6_val_probs = get_torch_predictions(abl6_test, X_va_final)
+    abl6_threshold = find_optimal_threshold(y_va_final, abl6_val_probs)
+    abl6_tp = get_torch_predictions(abl6_test, X_te_s)
+    abl6_test_m = compute_metrics(y_test_arr, abl6_tp, abl6_threshold)
+
+    # 4. Classical baselines on test (8 genes)
+    cl_cfg = config["classical_baselines"]
+    svm_test, _ = train_svm(X_tr_final, y_tr_final, X_va_final, y_va_final, cl_cfg["svm"], 42)
+    _, svm_tp = get_classical_predictions(svm_test, X_te_s)
+    svm_test_m = compute_metrics(y_test_arr, svm_tp)
+
+    rf_test, _ = train_random_forest(X_tr_final, y_tr_final, X_va_final, y_va_final, cl_cfg["random_forest"], 42)
+    _, rf_tp = get_classical_predictions(rf_test, X_te_s)
+    rf_test_m = compute_metrics(y_test_arr, rf_tp)
+
+    xgb_test, _ = train_xgboost(X_tr_final, y_tr_final, X_va_final, y_va_final, cl_cfg["xgboost"], 42)
+    _, xgb_tp = get_classical_predictions(xgb_test, X_te_s)
+    xgb_test_m = compute_metrics(y_test_arr, xgb_tp)
+
+    test_results = {
+        "Hybrid Quantum (57 params)": h_test_metrics,
+        "Classical Ablation-5 (51 params)": abl5_test_m,
+        "Classical Ablation-6 (61 params)": abl6_test_m,
+        "SVM-RBF (8 genes)": svm_test_m,
+        "Random Forest (8 genes)": rf_test_m,
+        "XGBoost (8 genes)": xgb_test_m,
+    }
+
+    print("\n" + "=" * 80)
+    print("HELD-OUT TEST SET RESULTS (Evaluated ONCE)")
+    print("=" * 80)
+    test_df = pd.DataFrame(test_results).T
+    test_df.index.name = "Model"
+    print(test_df.to_string())
+    test_df.to_csv("results/test_results.csv")
+    logger.info("Saved test results to results/test_results.csv")
+
+    # ROC curves for test set
+    roc_data = {}
+    for name, probs in [
+        ("Hybrid Quantum (57p)", h_test_probs),
+        ("Ablation-5 (51p)", abl5_tp),
+        ("Ablation-6 (61p)", abl6_tp),
+        ("SVM-RBF", svm_tp),
+        ("Random Forest", rf_tp),
+        ("XGBoost", xgb_tp),
+    ]:
+        if len(np.unique(y_test_arr)) >= 2:
+            fpr, tpr, _ = roc_curve(y_test_arr, probs)
+            roc_data[name] = {
+                "fpr": fpr, "tpr": tpr,
+                "auc": roc_auc_score(y_test_arr, probs)
+            }
+
+    if roc_data:
+        plot_roc_comparison(roc_data, "results/roc_comparison.png")
+
+    # ================================================================
+    # PHASE 10: External Validation on Independent GEO Cohort (GSE42568)
+    # ================================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("PHASE 10: External Validation on Independent GEO Cohort (GSE42568)")
+    logger.info("=" * 50)
+
+    try:
+        geo_dir = config["data"].get("geo_dir", "data/geo")
+        geo_expr, geo_labels = load_geo_data(
+            data_dir=geo_dir,
+            accession="GSE42568",
+            common_genes=final_genes_8,
+            synthetic=args.synthetic,
+            seed=42,
         )
 
-        X_tr_raw = X_train_full[tr_idx]
-        y_tr_final = y_train_full[tr_idx]
-        X_va_raw = X_train_full[va_idx]
-        y_va_final = y_train_full[va_idx]
+        # Match columns: ensure exact same 8 genes in exact same order
+        geo_expr_matched = geo_expr[final_genes_8]
 
-        # Scale: fit on training portion only!
-        X_tr_final, X_va_final, X_te_s, scaler_test = scale_features(
-            X_tr_raw, X_va_raw, X_test_sel
-        )
+        # Cohort normalization: rank-normalize TCGA training pool and GEO cohort separately
+        tcga_pool_norm = rank_normalize_cohort(X_trainval[final_genes_8])
+        geo_norm = rank_normalize_cohort(geo_expr_matched)
 
-        pos_weight = compute_class_weights(y_tr_final)
-        qm_cfg = config["quantum_model"]
-        max_epochs_t = config["training"]["fast_max_epochs"] if fast else qm_cfg["max_epochs"]
+        # Fit MinMaxScaler on TCGA normalized pool only, transform GEO
+        _, geo_scaled, _, _ = scale_features(tcga_pool_norm.values, geo_norm.values)
 
-        # Train final hybrid
-        hybrid_test = HybridQuantumModel(n_qubits=len(sel_genes), n_layers=qm_cfg["n_layers"])
-        hybrid_test, _ = train_torch_model(
-            hybrid_test, X_tr_final, y_tr_final, X_va_final, y_va_final,
-            lr=qm_cfg["learning_rate"], batch_size=qm_cfg["batch_size"],
-            max_epochs=max_epochs_t, pos_weight=pos_weight, seed=42,
-        )
+        geo_y = geo_labels.values
 
-        # Choose threshold on validation, apply to test
-        h_val_probs = get_torch_predictions(hybrid_test, X_va_final)
-        h_test_threshold = find_optimal_threshold(y_va_final, h_val_probs)
+        # Zero-shot evaluation of models trained on TCGA
+        geo_h_probs = get_torch_predictions(hybrid_test, geo_scaled)
+        geo_h_metrics = compute_metrics(geo_y, geo_h_probs, threshold=h_test_threshold)
 
-        h_test_probs = get_torch_predictions(hybrid_test, X_te_s)
-        h_test_metrics = compute_metrics(y_test_arr, h_test_probs, h_test_threshold)
+        geo_a5_probs = get_torch_predictions(abl5_test, geo_scaled)
+        geo_a5_metrics = compute_metrics(geo_y, geo_a5_probs, threshold=abl5_threshold)
 
-        # Classical baselines on test
-        cl_cfg = config["classical_baselines"]
-        svm_test, _ = train_svm(X_tr_final, y_tr_final, X_va_final, y_va_final, cl_cfg["svm"], 42)
-        _, svm_tp = get_classical_predictions(svm_test, X_te_s)
-        svm_test_m = compute_metrics(y_test_arr, svm_tp)
+        geo_a6_probs = get_torch_predictions(abl6_test, geo_scaled)
+        geo_a6_metrics = compute_metrics(geo_y, geo_a6_probs, threshold=abl6_threshold)
 
-        rf_test, _ = train_random_forest(X_tr_final, y_tr_final, X_va_final, y_va_final, cl_cfg["random_forest"], 42)
-        _, rf_tp = get_classical_predictions(rf_test, X_te_s)
-        rf_test_m = compute_metrics(y_test_arr, rf_tp)
+        _, geo_svm_probs = get_classical_predictions(svm_test, geo_scaled)
+        geo_svm_metrics = compute_metrics(geo_y, geo_svm_probs)
 
-        xgb_test, _ = train_xgboost(X_tr_final, y_tr_final, X_va_final, y_va_final, cl_cfg["xgboost"], 42)
-        _, xgb_tp = get_classical_predictions(xgb_test, X_te_s)
-        xgb_test_m = compute_metrics(y_test_arr, xgb_tp)
+        _, geo_rf_probs = get_classical_predictions(rf_test, geo_scaled)
+        geo_rf_metrics = compute_metrics(geo_y, geo_rf_probs)
 
-        # Ablation on test
-        abl_test = ClassicalAblationModel(
-            n_inputs=len(sel_genes),
-            n_quantum_params=hybrid_test.count_parameters()["quantum"],
-        )
-        abl_test, _ = train_torch_model(
-            abl_test, X_tr_final, y_tr_final, X_va_final, y_va_final,
-            lr=qm_cfg["learning_rate"], batch_size=qm_cfg["batch_size"],
-            max_epochs=max_epochs_t, pos_weight=pos_weight, seed=42,
-        )
-        abl_val_probs = get_torch_predictions(abl_test, X_va_final)
-        abl_threshold = find_optimal_threshold(y_va_final, abl_val_probs)
-        abl_tp = get_torch_predictions(abl_test, X_te_s)
-        abl_test_m = compute_metrics(y_test_arr, abl_tp, abl_threshold)
+        _, geo_xgb_probs = get_classical_predictions(xgb_test, geo_scaled)
+        geo_xgb_metrics = compute_metrics(geo_y, geo_xgb_probs)
 
-        test_results = {
-            "Hybrid Quantum": h_test_metrics,
-            "Classical Ablation": abl_test_m,
-            "SVM-RBF": svm_test_m,
-            "Random Forest": rf_test_m,
-            "XGBoost": xgb_test_m,
+        geo_results = {
+            "Hybrid Quantum (57 params)": geo_h_metrics,
+            "Classical Ablation-5 (51 params)": geo_a5_metrics,
+            "Classical Ablation-6 (61 params)": geo_a6_metrics,
+            "SVM-RBF (8 genes)": geo_svm_metrics,
+            "Random Forest (8 genes)": geo_rf_metrics,
+            "XGBoost (8 genes)": geo_xgb_metrics,
         }
 
+        geo_df = pd.DataFrame(geo_results).T
+        geo_df.index.name = "Model"
         print("\n" + "=" * 80)
-        print("HELD-OUT TEST SET RESULTS")
+        print("EXTERNAL GEO VALIDATION (GSE42568 Zero-Shot Generalization)")
         print("=" * 80)
-        test_df = pd.DataFrame(test_results).T
-        test_df.index.name = "Model"
-        print(test_df.to_string())
-        test_df.to_csv("results/test_results.csv")
-        logger.info("Saved test results to results/test_results.csv")
-
-        # ROC curves for test set
-        roc_data = {}
-        for name, probs in [
-            ("Hybrid Quantum", h_test_probs),
-            ("SVM-RBF", svm_tp),
-            ("Random Forest", rf_tp),
-            ("XGBoost", xgb_tp),
-        ]:
-            if len(np.unique(y_test_arr)) >= 2:
-                fpr, tpr, _ = roc_curve(y_test_arr, probs)
-                roc_data[name] = {
-                    "fpr": fpr, "tpr": tpr,
-                    "auc": roc_auc_score(y_test_arr, probs)
-                }
-
-        if roc_data:
-            plot_roc_comparison(roc_data, "results/roc_comparison.png")
+        print(geo_df.to_string())
+        geo_df.to_csv("results/geo_test_results.csv")
+        logger.info("Saved external GEO validation results to results/geo_test_results.csv")
+    except Exception as e:
+        logger.warning(f"External GEO validation encountered an error: {e}")
 
     # ================================================================
     # DONE
@@ -900,12 +1082,16 @@ def main():
     logger.info("Results saved to: results/")
     logger.info("  - cv_results.csv")
     logger.info("  - test_results.csv")
+    logger.info("  - geo_test_results.csv")
     logger.info("  - parameter_counts.csv")
-    logger.info("  - statistical_tests.csv")
+    logger.info("  - statistical_tests.csv (Wilcoxon)")
+    logger.info("  - nadeau_bengio_tests.csv (Corrected resampled t-test)")
     logger.info("  - selected_genes.json")
+    logger.info("  - selection_stability.csv / .png")
     logger.info("  - learning_curve.csv / .png")
     logger.info("  - noisy_simulation.csv")
     logger.info("  - importance_*.csv / .png")
+    logger.info("  - pathway_enrichment.csv")
     logger.info("  - roc_comparison.png")
 
 

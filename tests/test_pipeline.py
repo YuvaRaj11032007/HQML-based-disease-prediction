@@ -18,13 +18,20 @@ import pandas as pd
 import pytest
 import torch
 
-from src.data import generate_synthetic_data, extract_patient_id, extract_sample_type
+from src.data import (
+    generate_synthetic_data,
+    extract_patient_id,
+    extract_sample_type,
+    compute_imbalance_ratio,
+    rank_normalize_cohort,
+)
 from src.features import (
     get_patient_cv_folds,
     patient_level_split,
     remove_low_quality_genes,
     scale_features,
     select_features_fold,
+    select_features_hierarchical,
 )
 from src.models_quantum import (
     ClassicalAblationModel,
@@ -33,7 +40,8 @@ from src.models_quantum import (
     train_torch_model,
 )
 from src.models_classical import train_svm, train_random_forest, train_xgboost, get_classical_predictions
-from src.evaluate import compute_metrics, find_optimal_threshold
+from src.evaluate import compute_metrics, find_optimal_threshold, nadeau_bengio_ttest
+from src.explain import compute_selection_stability
 
 
 # ================================================================
@@ -374,3 +382,102 @@ class TestMetrics:
         y_prob = np.array([0.1, 0.2, 0.3, 0.7, 0.8, 0.9])
         threshold = find_optimal_threshold(y_true, y_prob)
         assert 0 < threshold < 1
+
+
+# ================================================================
+# Test: Ablation Sandwich Parameters
+# ================================================================
+
+
+class TestAblationSandwich:
+    """Test that the 57-param hybrid model is sandwiched between 51-param and 61-param ablations."""
+
+    def test_ablation_parameter_counts(self):
+        hybrid = HybridQuantumModel(n_qubits=8, n_layers=2)
+        abl_5 = ClassicalAblationModel(n_inputs=8, hidden_units=5)
+        abl_6 = ClassicalAblationModel(n_inputs=8, hidden_units=6)
+
+        h_params = hybrid.count_parameters()["total"]
+        a5_params = abl_5.count_parameters()["total"]
+        a6_params = abl_6.count_parameters()["total"]
+
+        assert h_params == 57, f"Expected 57 hybrid params, got {h_params}"
+        assert a5_params == 51, f"Expected 51 params for 5-unit ablation, got {a5_params}"
+        assert a6_params == 61, f"Expected 61 params for 6-unit ablation, got {a6_params}"
+        assert a5_params < h_params < a6_params, "Hybrid must sit strictly between the two ablations"
+
+    def test_ablation_formula_default(self):
+        # Default formula should yield 5 hidden units when target=57
+        abl_default = ClassicalAblationModel(n_inputs=8, total_target_params=57)
+        assert abl_default.hidden == 5
+        assert abl_default.count_parameters()["total"] == 51
+
+
+# ================================================================
+# Test: Nadeau-Bengio Corrected Resampled t-Test
+# ================================================================
+
+
+class TestNadeauBengio:
+    """Test Nadeau-Bengio corrected resampled t-test."""
+
+    def test_correction_factor_and_df(self):
+        scores_a = [0.85 + 0.01 * i for i in range(25)]
+        scores_b = [0.80 + 0.01 * i for i in range(25)]
+        n_train = 80
+        n_test = 20
+
+        result = nadeau_bengio_ttest(scores_a, scores_b, n_train=n_train, n_test=n_test)
+
+        assert result["n_resamples"] == 25
+        assert result["df"] == 24
+        expected_cf = (1.0 / 25.0) + (20.0 / 80.0)
+        assert pytest.approx(result["correction_factor"]) == expected_cf
+        assert result["p_value"] < 0.05
+        assert result["significant"] is True
+
+
+# ================================================================
+# Test: Hierarchical Feature Selection & Normalization
+# ================================================================
+
+
+class TestHierarchicalSelectionAndCohortNorm:
+    """Test hierarchical feature selection, cohort normalization, and stability."""
+
+    def test_hierarchical_selection_subsets(self, synthetic_data):
+        expr_df, labels, _ = synthetic_data
+        genes_8, genes_50, genes_200 = select_features_hierarchical(
+            expr_df, labels, n_de_genes=100, n_qubit_genes=8, n_reference_genes=50, seed=42
+        )
+
+        assert len(genes_8) == 8
+        assert len(genes_50) == 50
+        assert len(genes_200) == 100
+        # 8-genes must be subset of 50-genes and 200-genes
+        assert set(genes_8).issubset(set(genes_50))
+        assert set(genes_50).issubset(set(genes_200))
+
+    def test_rank_normalize_cohort(self, synthetic_data):
+        expr_df, _, _ = synthetic_data
+        ranked = rank_normalize_cohort(expr_df.iloc[:10, :20])
+        assert ranked.shape == (10, 20)
+        assert (ranked.values >= 0.0).all() and (ranked.values <= 1.0).all()
+
+    def test_compute_imbalance_ratio(self):
+        labels = pd.Series([1] * 100 + [0] * 10)
+        ratio, ratio_str = compute_imbalance_ratio(labels)
+        assert pytest.approx(ratio) == 10.0
+        assert ratio_str == "10.0:1"
+
+    def test_compute_selection_stability(self):
+        folds_genes = [
+            ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"],
+            ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G9"],
+            ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G10"],
+        ]
+        stab_df = compute_selection_stability(folds_genes, top_k=8)
+        assert stab_df.iloc[0]["gene"] in ["G1", "G2", "G3", "G4", "G5", "G6", "G7"]
+        assert stab_df.iloc[0]["selection_count"] == 3
+        assert pytest.approx(stab_df.iloc[0]["selection_frequency"]) == 1.0
+

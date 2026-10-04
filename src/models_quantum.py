@@ -146,43 +146,54 @@ class HybridQuantumModel(nn.Module):
 
 
 class ClassicalAblationModel(nn.Module):
-    """Classical model matching the hybrid model's parameter count.
+    """Classical model matching or bounding the hybrid model's parameter count.
 
-    Replaces the quantum circuit with a classical neural network layer
-    having the same number of trainable parameters.
+    Replaces the quantum circuit with a classical neural network layer.
+    Using total target parameters (57):
+        hidden = (57 - 1) // (8 + 2) = 5 units -> 51 parameters (lower bound)
+        hidden = 6 units -> 61 parameters (upper bound)
+    The 57-parameter hybrid model is thus sandwiched between the 51- and 61-parameter ablations.
     """
 
-    def __init__(self, n_inputs: int = 8, n_quantum_params: int = 48):
+    def __init__(
+        self,
+        n_inputs: int = 8,
+        hidden_units: Optional[int] = None,
+        total_target_params: int = 57,
+        n_quantum_params: Optional[int] = None,
+    ):
         """Initialize the ablation model.
 
         Args:
             n_inputs: Number of input features (= n_qubits in hybrid).
-            n_quantum_params: Number of parameters the quantum circuit has.
-                StronglyEntanglingLayers(n_layers, n_qubits, 3) = n_layers * n_qubits * 3
+            hidden_units: Explicit number of hidden units (5 for 51 params, 6 for 61 params).
+            total_target_params: Total parameters of the hybrid model (default 57).
+            n_quantum_params: Kept for backwards compatibility.
         """
         super().__init__()
         self.n_inputs = n_inputs
 
-        # Calculate hidden layer size to match parameter count
-        # Quantum: n_quantum_params params
-        # We need: n_inputs * hidden + hidden (bias) ≈ n_quantum_params
-        # Plus output: hidden * 1 + 1 = hidden + 1
-        # Total classical replacement: n_inputs * hidden + hidden + hidden + 1
-        # Solve for hidden ≈ (n_quantum_params - 1) / (n_inputs + 2)
-        hidden = max(1, (n_quantum_params - 1) // (n_inputs + 2))
+        if hidden_units is not None:
+            self.hidden = hidden_units
+        else:
+            # Formula using total parameters (57):
+            # Network: n_inputs * hidden + hidden (bias)
+            # Output: hidden * 1 + 1 (bias)
+            # Total = hidden * (n_inputs + 2) + 1 = 10 * hidden + 1
+            # Solve for hidden: (total_target_params - 1) // (n_inputs + 2)
+            self.hidden = max(1, (total_target_params - 1) // (n_inputs + 2))
 
         self.network = nn.Sequential(
-            nn.Linear(n_inputs, hidden),
+            nn.Linear(n_inputs, self.hidden),
             nn.Tanh(),  # Similar range to quantum expectation values [-1, 1]
         )
-        self.classical_output = nn.Linear(hidden, 1)
+        self.classical_output = nn.Linear(self.hidden, 1)
         self.sigmoid = nn.Sigmoid()
 
-        self._quantum_param_target = n_quantum_params
+        total_p = self.count_parameters()["total"]
         logger.info(
-            f"ClassicalAblation: hidden={hidden}, "
-            f"total_params={self.count_parameters()['total']} "
-            f"(target quantum params: {n_quantum_params})"
+            f"ClassicalAblationModel: hidden={self.hidden}, "
+            f"total_params={total_p} (target={total_target_params})"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -202,10 +213,10 @@ class ClassicalAblationModel(nn.Module):
         """Count trainable parameters.
 
         Returns:
-            Dict with network and total parameter counts.
+            Dict with network, hidden units, and total parameter counts.
         """
         total = sum(p.numel() for p in self.parameters())
-        return {"classical_replacement": total, "total": total}
+        return {"hidden_units": self.hidden, "classical_replacement": total, "total": total}
 
 
 def compute_class_weights(labels: np.ndarray) -> torch.Tensor:

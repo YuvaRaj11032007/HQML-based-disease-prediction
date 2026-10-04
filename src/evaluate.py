@@ -3,7 +3,7 @@ Evaluation utilities: metrics computation, threshold selection, statistical test
 """
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -127,6 +127,92 @@ def paired_wilcoxon_test(
     logger.info(
         f"Wilcoxon test ({metric_name}): stat={stat:.4f}, p={p_val:.4f}, "
         f"significant={'Yes' if result['significant'] else 'No'}"
+    )
+
+    return result
+
+
+def nadeau_bengio_ttest(
+    scores_a: List[float],
+    scores_b: List[float],
+    n_train: int,
+    n_test: int,
+    metric_name: str = "AUC",
+    alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """Corrected resampled t-test (Nadeau and Bengio, 2003).
+
+    Corrects for the violation of independence caused by overlapping training
+    sets across repeated cross-validation folds and seeds.
+
+    With S seeds and K folds, total resamples R = S * K (e.g., 25 for 5x5).
+    Formula:
+        R = len(diffs)
+        d_r = scores_a[r] - scores_b[r]
+        d_bar = mean(d_r)
+        s^2 = sample_variance(d_r)
+        variance_corrected = (1 / R + n_test / n_train) * s^2
+        t_stat = d_bar / sqrt(variance_corrected)
+        df = R - 1
+        p_value = 2 * (1 - t_dist.cdf(|t_stat|, df))
+    """
+    from scipy.stats import t as student_t
+
+    scores_a = np.array(scores_a, dtype=float)
+    scores_b = np.array(scores_b, dtype=float)
+    diffs = scores_a - scores_b
+    R = len(diffs)
+
+    if R < 2 or np.all(diffs == 0) or np.isnan(diffs).any():
+        logger.warning(
+            f"Cannot perform Nadeau-Bengio test for {metric_name}: "
+            f"need >= 2 resamples with non-zero variance. Got {R} resamples."
+        )
+        return {
+            "t_stat": float("nan"),
+            "p_value": float("nan"),
+            "significant": False,
+            "df": max(R - 1, 1),
+            "mean_diff": float("nan") if R == 0 else float(np.mean(diffs)),
+            "correction_factor": float("nan"),
+            "n_resamples": R,
+        }
+
+    d_bar = float(np.mean(diffs))
+    s2 = float(np.var(diffs, ddof=1))
+
+    # Explicit 1 / R term (e.g., 1 / 25) plus n_test / n_train
+    correction_factor = (1.0 / float(R)) + (float(n_test) / float(n_train))
+    variance_corrected = correction_factor * s2
+
+    if variance_corrected <= 0 or np.isnan(variance_corrected):
+        return {
+            "t_stat": float("nan"),
+            "p_value": float("nan"),
+            "significant": False,
+            "df": R - 1,
+            "mean_diff": d_bar,
+            "correction_factor": correction_factor,
+            "n_resamples": R,
+        }
+
+    t_stat = float(d_bar / np.sqrt(variance_corrected))
+    df = R - 1
+    p_val = float(2.0 * (1.0 - student_t.cdf(abs(t_stat), df=df)))
+
+    result = {
+        "t_stat": t_stat,
+        "p_value": p_val,
+        "significant": bool(p_val < alpha),
+        "df": df,
+        "mean_diff": d_bar,
+        "correction_factor": correction_factor,
+        "n_resamples": R,
+    }
+
+    logger.info(
+        f"Nadeau-Bengio test ({metric_name}): t={t_stat:.4f}, p={p_val:.4f}, "
+        f"df={df}, significant={'Yes' if result['significant'] else 'No'}"
     )
 
     return result

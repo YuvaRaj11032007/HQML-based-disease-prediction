@@ -26,7 +26,7 @@ def permutation_importance_manual(
     seed: int = 42,
     is_torch: bool = False,
 ) -> pd.DataFrame:
-    """Compute permutation importance for any model.
+    """Compute permutation importance using ROC-AUC (robust to class imbalance).
 
     Args:
         model: Trained model (sklearn or torch).
@@ -38,22 +38,23 @@ def permutation_importance_manual(
         is_torch: Whether the model is a PyTorch model.
 
     Returns:
-        DataFrame with gene importances.
+        DataFrame with gene importances based on drop in ROC-AUC.
     """
-    from sklearn.metrics import accuracy_score
+    from sklearn.metrics import roc_auc_score
 
     rng = np.random.RandomState(seed)
 
-    def predict(X_in):
+    def predict_prob(X_in):
         if is_torch:
             model.eval()
             with torch.no_grad():
                 preds = model(torch.tensor(X_in, dtype=torch.float32))
-                return (preds.numpy().flatten() >= 0.5).astype(int)
+                return preds.numpy().flatten()
         else:
-            return model.predict(X_in)
+            return model.predict_proba(X_in)[:, 1]
 
-    baseline_score = accuracy_score(y, predict(X))
+    baseline_prob = predict_prob(X)
+    baseline_score = roc_auc_score(y, baseline_prob)
     importances = []
 
     for i, gene in enumerate(gene_names):
@@ -61,17 +62,79 @@ def permutation_importance_manual(
         for _ in range(n_repeats):
             X_permuted = X.copy()
             X_permuted[:, i] = rng.permutation(X_permuted[:, i])
-            perm_score = accuracy_score(y, predict(X_permuted))
+            perm_prob = predict_prob(X_permuted)
+            perm_score = roc_auc_score(y, perm_prob)
             scores.append(baseline_score - perm_score)
         importances.append(
             {
                 "gene": gene,
-                "importance_mean": np.mean(scores),
-                "importance_std": np.std(scores),
+                "importance_mean": float(np.mean(scores)),
+                "importance_std": float(np.std(scores)),
             }
         )
 
     df = pd.DataFrame(importances).sort_values("importance_mean", ascending=False)
+    return df
+
+
+def compute_selection_stability(
+    all_selected_gene_lists: List[List[str]],
+    top_k: int = 8,
+    output_csv: str = "results/selection_stability.csv",
+    output_png: Optional[str] = "results/selection_stability.png",
+) -> pd.DataFrame:
+    """Compute and report selection stability for biomarker genes across folds.
+
+    Counts how frequently each gene is selected in the top-k qubit set across
+    all folds and random seeds.
+
+    Args:
+        all_selected_gene_lists: List of gene lists (one per fold/seed).
+        top_k: Number of genes selected per fold (e.g. 8).
+        output_csv: Path to save stability CSV.
+        output_png: Path to save stability bar plot.
+
+    Returns:
+        DataFrame with gene, count, frequency, rank.
+    """
+    from collections import Counter
+
+    total_folds = len(all_selected_gene_lists)
+    all_genes = [g for sublist in all_selected_gene_lists for g in sublist]
+    counts = Counter(all_genes)
+
+    rows = []
+    for gene, count in counts.most_common():
+        rows.append({
+            "gene": gene,
+            "selection_count": count,
+            "total_folds": total_folds,
+            "selection_frequency": count / max(total_folds, 1),
+        })
+
+    df = pd.DataFrame(rows)
+    df["rank"] = range(1, len(df) + 1)
+
+    if output_csv:
+        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+        df.to_csv(output_csv, index=False)
+        logger.info(f"Saved selection stability to {output_csv}")
+
+    if output_png and len(df) > 0:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        top_plot = df.head(15).sort_values("selection_frequency", ascending=True)
+        ax.barh(top_plot["gene"], top_plot["selection_frequency"] * 100, color="teal", alpha=0.85)
+        ax.set_xlabel("Selection Frequency Across Folds (%)")
+        ax.set_title(f"Gene Selection Stability (Top {top_k} Qubit Genes across {total_folds} Folds)")
+        ax.set_xlim([0, 105])
+        for i, (val, cnt) in enumerate(zip(top_plot["selection_frequency"] * 100, top_plot["selection_count"])):
+            ax.text(val + 1, i, f"{cnt}/{total_folds} ({val:.1f}%)", va="center", fontsize=9)
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(output_png), exist_ok=True)
+        plt.savefig(output_png, dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info(f"Saved selection stability plot to {output_png}")
+
     return df
 
 
@@ -185,7 +248,7 @@ def plot_permutation_importance(
         color="steelblue",
         alpha=0.8,
     )
-    ax.set_xlabel("Importance (decrease in accuracy)")
+    ax.set_xlabel("Importance (decrease in ROC-AUC)")
     ax.set_title(f"Permutation Importance - {model_name}")
     ax.axvline(x=0, color="gray", linestyle="--", alpha=0.5)
 

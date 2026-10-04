@@ -262,6 +262,75 @@ def select_features_fold(
     return selected
 
 
+def select_features_hierarchical(
+    X_train_fold: pd.DataFrame,
+    y_train_fold: pd.Series,
+    n_de_genes: int = 200,
+    n_qubit_genes: int = 8,
+    n_reference_genes: int = 50,
+    seed: int = 42,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Select features with a single shared Welch's t-test step.
+
+    Pipeline:
+    1. Single Welch's t-test step on training partition -> top n_de_genes (top 200).
+    2. Mutual information ranking on the top DE genes -> top n_qubit_genes (8)
+       and top n_reference_genes (50).
+
+    Args:
+        X_train_fold: Training expression data for this fold.
+        y_train_fold: Training labels for this fold.
+        n_de_genes: Top DE genes from t-test (default 200).
+        n_qubit_genes: Final qubit features (default 8).
+        n_reference_genes: Reference baseline features (default 50).
+        seed: Random seed for MI estimation.
+
+    Returns:
+        Tuple of (selected_8_genes, selected_50_genes, top_200_de_genes).
+    """
+    tumor_mask = y_train_fold == 1
+    normal_mask = y_train_fold == 0
+
+    tumor_data = X_train_fold.loc[tumor_mask]
+    normal_data = X_train_fold.loc[normal_mask]
+
+    t_stats = []
+    p_vals = []
+    for gene in X_train_fold.columns:
+        t_stat, p_val = stats.ttest_ind(
+            tumor_data[gene].values,
+            normal_data[gene].values,
+            equal_var=False,  # Welch's t-test
+        )
+        t_stats.append(abs(t_stat))
+        p_vals.append(p_val)
+
+    de_results = pd.DataFrame(
+        {"gene": X_train_fold.columns, "t_stat": t_stats, "p_value": p_vals}
+    )
+    de_results = de_results.sort_values("t_stat", ascending=False)
+
+    top_de = de_results.head(n_de_genes)["gene"].tolist()
+    X_de = X_train_fold[top_de]
+
+    # Mutual information ranking once on the top DE genes
+    mi_scores = mutual_info_classif(
+        X_de.values, y_train_fold.values, random_state=seed, n_neighbors=5
+    )
+    mi_df = pd.DataFrame({"gene": top_de, "mi_score": mi_scores})
+    mi_df = mi_df.sort_values("mi_score", ascending=False)
+
+    selected_qubit = mi_df.head(n_qubit_genes)["gene"].tolist()
+    selected_reference = mi_df.head(n_reference_genes)["gene"].tolist()
+
+    logger.info(
+        f"Hierarchical feature selection: top {len(top_de)} DE -> "
+        f"{len(selected_qubit)} qubit genes, {len(selected_reference)} reference genes"
+    )
+
+    return selected_qubit, selected_reference, top_de
+
+
 def scale_features(
     X_train: np.ndarray,
     X_val: np.ndarray,

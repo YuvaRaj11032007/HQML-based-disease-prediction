@@ -1,3 +1,4 @@
-Model,quantum,classical,total,classical_replacement
-Hybrid Quantum,48.0,9.0,57,
-Classical Ablation,,,41,41.0
+Model,Total Parameters,Architecture,Comparison to Hybrid
+Classical Ablation-5,51,"Linear(8,5) + Tanh + Linear(5,1)",Lower bound (-6 params)
+Hybrid Quantum,57,"AngleEmbedding(8) + StronglyEntangling(L=2) + Linear(8,1)",Target (48 quantum + 9 classical)
+Classical Ablation-6,61,"Linear(8,6) + Tanh + Linear(6,1)",Upper bound (+4 params)
