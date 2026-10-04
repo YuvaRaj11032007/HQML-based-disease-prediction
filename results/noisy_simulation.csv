@@ -1,0 +1,3 @@
+accuracy,sensitivity,specificity,auc,noise_level
+0.7916666666666666,0.95,0.0,0.4875,0.01
+0.7916666666666666,0.95,0.0,0.4875,0.05
