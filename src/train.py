@@ -534,13 +534,17 @@ def main():
         min_expression=feat_cfg["min_expression"],
     )
 
-    # Map Ensembl to gene symbols (skip for synthetic)
+    # Map Ensembl to gene symbols (if columns are Ensembl IDs)
     if not args.synthetic:
-        try:
-            probe_map = load_probemap(config["data"]["data_dir"], config["data"]["probemap_url"])
-            expr_df = map_ensembl_to_symbols(expr_df, probe_map)
-        except Exception as e:
-            logger.warning(f"Could not load probe map: {e}. Keeping Ensembl IDs.")
+        has_ensembl = any(str(c).startswith("ENSG") for c in expr_df.columns[:50])
+        if has_ensembl:
+            try:
+                probe_map = load_probemap(config["data"]["data_dir"], config["data"]["probemap_url"])
+                expr_df = map_ensembl_to_symbols(expr_df, probe_map)
+            except Exception as e:
+                logger.warning(f"Could not load probe map: {e}. Keeping existing IDs.")
+        else:
+            logger.info("Expression matrix already uses Hugo Gene Symbols. Skipping Ensembl mapping.")
 
     # Patient-level split
     seed = config["data"]["random_seed"]

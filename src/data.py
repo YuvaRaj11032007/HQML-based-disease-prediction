@@ -8,6 +8,7 @@ Extracts labels from TCGA barcode sample-type codes:
 """
 
 import gzip
+import io
 import logging
 import os
 import shutil
@@ -125,19 +126,38 @@ def load_tcga_data(
     data_dir = data_cfg["data_dir"]
     os.makedirs(data_dir, exist_ok=True)
 
-    # --- Download expression matrix ---
-    expr_gz = os.path.join(data_dir, "TCGA-BRCA.htseq_fpkm-uq.tsv.gz")
-    expr_tsv = os.path.join(data_dir, "TCGA-BRCA.htseq_fpkm-uq.tsv")
-    download_file(data_cfg["expression_url"], expr_gz)
+    # Check for existing downloaded files first
+    candidate_files = [
+        os.path.join(data_dir, "TCGA-BRCA.htseq_fpkm-uq.tsv.gz"),
+        os.path.join(data_dir, "TCGA-BRCA.HiSeqV2.tsv.gz"),
+        os.path.join(data_dir, "TCGA-BRCA.htseq_fpkm-uq.tsv"),
+        os.path.join(data_dir, "TCGA-BRCA.HiSeqV2.tsv"),
+    ]
+    expr_file = None
+    for cand in candidate_files:
+        if os.path.exists(cand):
+            expr_file = cand
+            logger.info(f"Using local TCGA expression matrix: {expr_file}")
+            break
 
-    if not os.path.exists(expr_tsv):
-        logger.info("Decompressing expression matrix...")
-        with gzip.open(expr_gz, "rb") as f_in, open(expr_tsv, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+    if expr_file is None:
+        expr_gz = os.path.join(data_dir, "TCGA-BRCA.htseq_fpkm-uq.tsv.gz")
+        try:
+            download_file(data_cfg["expression_url"], expr_gz)
+            expr_file = expr_gz
+        except Exception as e:
+            logger.warning(
+                f"Download from primary URL failed ({e}). "
+                f"Falling back to verified UCSC Xena TCGA Hub RNA-seq dataset..."
+            )
+            fallback_url = "https://tcga.xenahubs.net/download/TCGA.BRCA.sampleMap/HiSeqV2.gz"
+            fallback_gz = os.path.join(data_dir, "TCGA-BRCA.HiSeqV2.tsv.gz")
+            download_file(fallback_url, fallback_gz)
+            expr_file = fallback_gz
 
     # --- Load expression matrix (genes as rows, samples as columns) ---
-    logger.info("Loading expression matrix (this may take a minute)...")
-    expr_df = pd.read_csv(expr_tsv, sep="\t", index_col=0)
+    logger.info(f"Loading expression matrix from {expr_file} (this may take a minute)...")
+    expr_df = pd.read_csv(expr_file, sep="\t", index_col=0)
     logger.info(f"Raw expression matrix: {expr_df.shape[0]} genes x {expr_df.shape[1]} samples")
 
     # --- Filter samples by barcode sample-type ---
@@ -299,43 +319,133 @@ def load_geo_data(
     """Load or simulate an external GEO breast cancer validation cohort (GSE42568).
 
     GSE42568 contains 104 breast tumor samples and 17 normal breast tissue controls
-    profiled on the Affymetrix HG-U133 Plus 2.0 microarray platform.
+    profiled on the Affymetrix HG-U133 Plus 2.0 (GPL570) microarray platform.
 
     Args:
         data_dir: Directory for GEO data cache.
         accession: GEO accession ID (default: 'GSE42568').
         common_genes: Optional list of genes to subset to.
-        synthetic: If True or if download is not accessible, generate synthetic GEO data.
+        synthetic: If True, generate synthetic GEO data.
         seed: Random seed.
 
     Returns:
         Tuple of (geo_expr_df, geo_labels).
     """
     os.makedirs(data_dir, exist_ok=True)
-    geo_file = os.path.join(data_dir, f"{accession}_series_matrix.txt.gz")
+    matrix_gz = os.path.join(data_dir, f"{accession}_series_matrix.txt.gz")
+    annot_gz = os.path.join(data_dir, "GPL570.annot.gz")
 
-    # In synthetic mode or fallback, generate realistic cohort matching GSE42568 dimensions
-    if synthetic or not os.path.exists(geo_file):
-        logger.info(
-            f"Generating external validation cohort ({accession}: 104 tumor, 17 normal samples)..."
-        )
-        rng = np.random.RandomState(seed)
-        n_tumor = 104
-        n_normal = 17
-        n_total = n_tumor + n_normal
-        labels_arr = np.array([1] * n_tumor + [0] * n_normal)
+    if not synthetic:
+        # Check if local files exist, or try to download
+        geo_matrix_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/GSE42nnn/{accession}/matrix/{accession}_series_matrix.txt.gz"
+        geo_annot_url = "https://ftp.ncbi.nlm.nih.gov/geo/platforms/GPLnnn/GPL570/annot/GPL570.annot.gz"
 
-        genes = common_genes if common_genes is not None else [f"GENE_{i}" for i in range(200)]
-        # Microarray intensity log2 values typically span ~4.0 to ~14.0
-        base_expr = rng.uniform(4.0, 14.0, size=(n_total, len(genes)))
-        for i in range(min(len(genes), 50)):
-            direction = 1.0 if i % 2 == 0 else -1.0
-            base_expr[labels_arr == 1, i] += direction * rng.uniform(1.0, 2.5)
+        try:
+            if not os.path.exists(matrix_gz):
+                download_file(geo_matrix_url, matrix_gz)
+            if not os.path.exists(annot_gz):
+                download_file(geo_annot_url, annot_gz)
+        except Exception as e:
+            logger.warning(f"Failed downloading GEO files: {e}. Falling back to synthetic cohort.")
 
-        sample_ids = [f"GSM1044{i:03d}" for i in range(n_total)]
-        geo_df = pd.DataFrame(base_expr, index=sample_ids, columns=genes)
-        geo_labels = pd.Series(labels_arr, index=sample_ids, name="label")
-        return geo_df, geo_labels
+        if os.path.exists(matrix_gz) and os.path.exists(annot_gz):
+            logger.info(f"Parsing real GEO dataset ({accession}) and platform annotation (GPL570)...")
+            try:
+                # 1. Parse probe to symbol mapping from GPL570
+                probe_to_symbol = {}
+                with gzip.open(annot_gz, "rt", encoding="utf-8", errors="ignore") as f:
+                    header_found = False
+                    id_col = 0
+                    sym_col = 2
+                    for line in f:
+                        if line.startswith("#") or not line.strip():
+                            continue
+                        parts = line.strip().split("\t")
+                        if not header_found:
+                            if "ID" in parts and any("Gene symbol" in p or "Gene Symbol" in p for p in parts):
+                                header_found = True
+                                id_col = parts.index("ID")
+                                for p_idx, p_name in enumerate(parts):
+                                    if "Gene symbol" in p_name or "Gene Symbol" in p_name:
+                                        sym_col = p_idx
+                                        break
+                            continue
+                        if len(parts) > max(id_col, sym_col):
+                            probe = parts[id_col].strip()
+                            sym = parts[sym_col].strip()
+                            if sym and sym != "---":
+                                probe_to_symbol[probe] = sym.split("///")[0].strip()
 
-    logger.info(f"Loading local GEO dataset: {geo_file}")
-    return pd.DataFrame(), pd.Series()
+                # 2. Parse series matrix table
+                sample_ids = []
+                labels = []
+                lines_data = []
+                in_table = False
+
+                with gzip.open(matrix_gz, "rt", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("!Sample_geo_accession"):
+                            sample_ids = [x.strip('"\n ') for x in line.split("\t")[1:]]
+                        elif line.startswith("!Sample_characteristics_ch1\t\"tissue:"):
+                            tissues = [x.strip('"\n ') for x in line.split("\t")[1:]]
+                            labels = [1 if "cancer" in t.lower() or "tumor" in t.lower() else 0 for t in tissues]
+                        elif line.startswith("!series_matrix_table_begin"):
+                            in_table = True
+                            continue
+                        elif line.startswith("!series_matrix_table_end"):
+                            break
+                        elif in_table:
+                            lines_data.append(line)
+
+                data_str = "".join(lines_data)
+                df = pd.read_csv(io.StringIO(data_str), sep="\t", index_col=0)
+                df.index = df.index.astype(str)
+
+                # Map probe IDs to gene symbols
+                df["gene_symbol"] = df.index.map(probe_to_symbol)
+                df = df.dropna(subset=["gene_symbol"])
+                df["mean_expr"] = df[sample_ids].mean(axis=1)
+                df = df.sort_values("mean_expr", ascending=False).drop_duplicates(subset=["gene_symbol"])
+                df = df.set_index("gene_symbol")[sample_ids]
+
+                expr_df = df.T
+                labels_series = pd.Series(labels, index=sample_ids, name="label")
+
+                # If common_genes provided, subset or align
+                if common_genes is not None:
+                    missing = [g for g in common_genes if g not in expr_df.columns]
+                    if missing:
+                        logger.warning(f"GEO cohort missing {len(missing)} genes: {missing}. Imputing 0.0.")
+                        for mg in missing:
+                            expr_df[mg] = 0.0
+                    expr_df = expr_df[common_genes]
+
+                logger.info(
+                    f"Successfully loaded real GEO cohort ({accession}): "
+                    f"{expr_df.shape[0]} samples ({(labels_series==1).sum()} tumor, "
+                    f"{(labels_series==0).sum()} normal), {expr_df.shape[1]} genes"
+                )
+                return expr_df, labels_series
+            except Exception as e:
+                logger.error(f"Error parsing real GEO data: {e}. Falling back to synthetic cohort.")
+
+    # Synthetic fallback mode
+    logger.info(
+        f"Generating synthetic external validation cohort ({accession}: 104 tumor, 17 normal samples)..."
+    )
+    rng = np.random.RandomState(seed)
+    n_tumor = 104
+    n_normal = 17
+    n_total = n_tumor + n_normal
+    labels_arr = np.array([1] * n_tumor + [0] * n_normal)
+
+    genes = common_genes if common_genes is not None else [f"GENE_{i}" for i in range(200)]
+    base_expr = rng.uniform(4.0, 14.0, size=(n_total, len(genes)))
+    for i in range(min(len(genes), 50)):
+        direction = 1.0 if i % 2 == 0 else -1.0
+        base_expr[labels_arr == 1, i] += direction * rng.uniform(1.0, 2.5)
+
+    sample_ids = [f"GSM1044{i:03d}" for i in range(n_total)]
+    geo_df = pd.DataFrame(base_expr, index=sample_ids, columns=genes)
+    geo_labels = pd.Series(labels_arr, index=sample_ids, name="label")
+    return geo_df, geo_labels
