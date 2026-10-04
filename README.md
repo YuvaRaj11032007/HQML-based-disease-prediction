@@ -1,5 +1,6 @@
 # Hybrid Quantum-Classical ML for Early Breast Cancer Detection
 
+[![GitHub Repo](https://img.shields.io/badge/GitHub-HQML--based--disease--prediction-blue?logo=github)](https://github.com/YuvaRaj11032007/HQML-based-disease-prediction)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://img.shields.io/badge/pytest-17%20passed-brightgreen.svg)]()
@@ -8,7 +9,9 @@
 
 > **Smart India Hackathon (SIH 2026)**  
 > **Problem Statement ID**: `SIH26139`  
-> **Title**: *Hybrid Quantum Machine Learning Platform for Early Disease Detection*
+> **Title**: *Hybrid Quantum Machine Learning Platform for Early Disease Detection*  
+> **Official SIH Technical Report**: [📄 Read Full SIH 2026 Project Report (docs/SIH_PROJECT_REPORT.md)](docs/SIH_PROJECT_REPORT.md)  
+> **Repository**: [https://github.com/YuvaRaj11032007/HQML-based-disease-prediction](https://github.com/YuvaRaj11032007/HQML-based-disease-prediction)
 
 ---
 
@@ -165,8 +168,8 @@ Evaluating noise sensitivity under mixed-state density matrix evolution:
 ### Installation
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/hybrid-qml-breast-cancer.git
-cd hybrid-qml-breast-cancer
+git clone https://github.com/YuvaRaj11032007/HQML-based-disease-prediction.git
+cd HQML-based-disease-prediction
 
 # Create and activate virtual environment
 python -m venv venv
